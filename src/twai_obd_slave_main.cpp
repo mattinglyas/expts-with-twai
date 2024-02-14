@@ -13,6 +13,13 @@
 /* -------------------------------------------------------------------------- */
 /*                      Definitions and static variables                      */
 /* -------------------------------------------------------------------------- */
+#ifndef MIN
+#define MIN(a, b) ((a) > (b) ? (b) : (a))
+#endif
+
+#ifndef MAX
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#endif
 
 #define RX_TASK_PRIO 8
 #define TX_TASK_PRIO 9
@@ -37,18 +44,6 @@
 
 typedef enum
 {
-    TX_SEND,
-    TX_IDLE,
-} tx_task_action_t;
-
-typedef enum
-{
-    RX_RECV,
-    RX_IDLE,
-} rx_task_action_t;
-
-typedef enum
-{
     RX_RECV_REQ,
     TX_SEND_SNGL,
     TX_SEND_FRST,
@@ -65,16 +60,17 @@ static const twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
 static const twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
 static const twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
-static QueueHandle_t tx_task_queue;
-static QueueHandle_t rx_task_queue;
-static QueueHandle_t tx_msg_queue;
-static QueueHandle_t rx_msg_queue;
-
-static SemaphoreHandle_t ctrl_task_sem;
+static SemaphoreHandle_t twai_task_sem;
 static SemaphoreHandle_t obd_info_mut;
 
 static uint16_t rpm;
 static uint8_t speed;
+
+#define MSB_BYTE(A) ((A >> 8) & 0xFF)
+#define LSB_BYTE(A) ((A) & 0xFF)
+#define MSB_NIBBLE(A) ((A >> 4) & 0x0F)
+#define LSB_NIBBLE(A) ((A) & 0x0F)
+
 // KMHC75LD0MU250580
 static const uint8_t vin[] = {
     0x4B, 0x4D, 0x48, 0x43, 0x37, 
@@ -86,60 +82,16 @@ static const uint8_t vin[] = {
 /*                             Tasks and Functions                            */
 /* -------------------------------------------------------------------------- */
 
-static void twai_receive_task(void *arg)
-{
-    rx_task_action_t rx_action;
-    twai_message_t msg;
-
-    for (;;)
-    {
-        xQueueReceive(rx_task_queue, &rx_action, portMAX_DELAY);
-        switch (rx_action)
-        {
-        case RX_RECV:
-            ESP_LOGI(RX_TAG, "start receive");
-            twai_receive(&msg, portMAX_DELAY);
-            xQueueSend(rx_msg_queue, &msg, portMAX_DELAY);
-            xSemaphoreGive(ctrl_task_sem);
-            break;
-        default:
-            // idle
-            break;
-        }
-    }
-}
-
-static void twai_transmit_task(void *arg)
-{
-    tx_task_action_t tx_action;
-    twai_message_t msg;
-
-    for (;;)
-    {
-        xQueueReceive(tx_task_queue, &tx_action, portMAX_DELAY);
-        switch (tx_action)
-        {
-        case TX_SEND:
-            ESP_LOGI(TX_TAG, "start send");
-            xQueueReceive(tx_msg_queue, &msg, portMAX_DELAY);
-            twai_transmit(&msg, portMAX_DELAY);
-            xSemaphoreGive(ctrl_task_sem);
-            break;
-        default:
-            // idle
-            break;
-        }
-    }
-}
-
 static void twai_control_task(void *arg)
 {
-    xSemaphoreTake(ctrl_task_sem, portMAX_DELAY);
-    tx_task_action_t tx_action = TX_SEND;
-    rx_task_action_t rx_action = RX_RECV;
+    xSemaphoreTake(twai_task_sem, portMAX_DELAY);
     twai_message_t inc_msg; // incoming and outgoing relative to control task
     twai_message_t out_msg;
-    uint16_t rem_len;
+    uint16_t rem_dta; // len remaining data in dta
+    uint16_t dta_len;  // current location of data in dta to be transmitted
+    uint8_t clear_to_send = 0; // remaining #of frames clear-to-send
+    uint8_t frame_len = 0; // number of data bytes in this frame
+    uint8_t cons_delay = 0; // delay between consecutive frames
     uint8_t dta[4096]; // maximum length of data by CAN-TP spec
     ctrl_task_action_t state;
 
@@ -149,9 +101,10 @@ static void twai_control_task(void *arg)
     for (;;)
     {
         // reset finite state machine for the next request
-        ESP_LOGI(CTRL_TAG, "waiting for next request from master");
+        ESP_LOGI(CTRL_TAG, "receive request");
         state = RX_RECV_REQ;
-        rem_len = 0;
+        rem_dta = 0;
+        dta_len = 0;
 
         while (state != IDLE)
         {
@@ -159,12 +112,10 @@ static void twai_control_task(void *arg)
             {
             case RX_RECV_REQ:
                 // listen for the next time the obd diagnostic tool asks for something
-                xQueueSend(rx_task_queue, &rx_action, portMAX_DELAY);
-                xSemaphoreTake(ctrl_task_sem, portMAX_DELAY);
-                xQueueReceive(rx_msg_queue, &inc_msg, portMAX_DELAY);
+                twai_receive(&inc_msg, portMAX_DELAY);
                 ESP_LOGI(
                     CTRL_TAG, 
-                    "got request %02x %02x from master", 
+                    "identified request %02x %02x", 
                     inc_msg.data[1], 
                     inc_msg.data[2]
                 );
@@ -181,18 +132,18 @@ static void twai_control_task(void *arg)
                         dta[0] = (uint8_t) (rpm >> 8);
                         dta[1] = (uint8_t) rpm;
                         xSemaphoreGive(obd_info_mut);
-                        rem_len = 2;
+                        rem_dta = 2;
                         break;
                     case OBD_DEV_SPD:
                         // 0x01 0x0D
                         xSemaphoreTake(obd_info_mut, portMAX_DELAY);
                         dta[0] = speed;
                         xSemaphoreGive(obd_info_mut);
-                        rem_len = 1;
+                        rem_dta = 1;
                         break;
                     default:
                         // unsupported device
-                        ESP_LOGE(CTRL_TAG, "unsupported device!");
+                        ESP_LOGE(CTRL_TAG, "identfied unsupported device!");
                         break;
                     }
                     break;
@@ -202,21 +153,21 @@ static void twai_control_task(void *arg)
                     case OBD_INF_VIN:
                         // 0x09 0x02
                         memcpy(dta, vin, 17);
-                        rem_len = 17;
+                        rem_dta = 17;
                         break;
                     default:
                         // unsupported info
-                        ESP_LOGE(CTRL_TAG, "unsupported info!");
+                        ESP_LOGE(CTRL_TAG, "identified unsupported info!");
                         break;
                     }
                     break;
                 default:
                     // unsupported service
-                    ESP_LOGE(CTRL_TAG, "unsupported service!");
+                    ESP_LOGE(CTRL_TAG, "identified unsupported service!");
                     break;
                 }
 
-                if (rem_len > 7)
+                if (rem_dta > 7)
                 {
                     state = TX_SEND_FRST;
                 }
@@ -226,21 +177,92 @@ static void twai_control_task(void *arg)
                 }
                 break;
             case TX_SEND_SNGL:
+                ESP_LOGI(
+                    CTRL_TAG, 
+                    "transmit single frame (%d bytes remain)",
+                    rem_dta
+                    );
                 out_msg.identifier = ID_SLAVE_RESP_DTA;
                 out_msg.data_length_code = 8;
-                out_msg.data[0] = rem_len; // 0x0L
-                memcpy(&out_msg.data[1], dta, rem_len);
+                frame_len = rem_dta;
+                out_msg.data[0] = frame_len; // 0x0L
+                memcpy(&out_msg.data[1], &dta[dta_len], frame_len);
+                dta_len += frame_len;
+                rem_dta -= frame_len;
 
-                xQueueSend(tx_msg_queue, &out_msg, portMAX_DELAY);
-                xQueueSend(tx_task_queue, &tx_action, portMAX_DELAY);
-                xSemaphoreTake(ctrl_task_sem, portMAX_DELAY);
+                twai_transmit(&out_msg, portMAX_DELAY);
                 state = IDLE;
                 break;
             case TX_SEND_FRST:
+                ESP_LOGI(
+                    CTRL_TAG, 
+                    "transmit first frame (%d bytes remain)", 
+                    rem_dta
+                    );
+                out_msg.identifier = ID_SLAVE_RESP_DTA;
+                out_msg.data_length_code = 8;
+                frame_len = 6;
+                out_msg.data[0] = (0x01 << 4) | LSB_NIBBLE(MSB_BYTE(rem_dta));
+                out_msg.data[1] = LSB_BYTE(rem_dta);
+                memcpy(&out_msg.data[2], &dta[dta_len], frame_len);
+                dta_len += frame_len;
+                rem_dta -= frame_len;
+
+                twai_transmit(&out_msg, portMAX_DELAY);
+                state = RX_RECV_FLOW;
+                break;
             case RX_RECV_FLOW:
+                ESP_LOGI(CTRL_TAG, "receive clear-to-send");
+                twai_receive(&inc_msg, portMAX_DELAY);
+                clear_to_send = inc_msg.data[1];
+                cons_delay = inc_msg.data[2];
+                
+                ESP_LOGI(
+                    CTRL_TAG,
+                    "identified BS: %02x; STmin: %02x",
+                    clear_to_send,
+                    cons_delay      
+                );
+
+                state = TX_SEND_CONS; 
+                break;
             case TX_SEND_CONS:
+                vTaskDelay(pdMS_TO_TICKS(cons_delay));
+                ESP_LOGI(
+                    CTRL_TAG,
+                    "transmit consecutive (%02x; %d bytes remain)", 
+                    clear_to_send,
+                    rem_dta
+                );
+
+                out_msg.identifier = ID_SLAVE_RESP_DTA;
+                out_msg.data_length_code = 8;
+                frame_len = MIN(7, rem_dta);
+                memcpy(&out_msg.data[2], &dta[dta_len], frame_len);
+                twai_transmit(&out_msg, portMAX_DELAY);
+                dta_len += frame_len;
+                rem_dta -= frame_len;
+                clear_to_send--;
+
+                if (rem_dta)
+                {
+                    if (clear_to_send == 0)
+                    {
+                        state = RX_RECV_FLOW;
+                    }
+                    else
+                    {
+                        state = TX_SEND_CONS;
+                    }
+                }
+                else
+                {
+                    state = IDLE;
+                }
+                break;
             case IDLE:
             default:
+                state = IDLE;
                 break;
             }
         }
@@ -281,32 +303,10 @@ extern "C" void app_main(void)
     }
 
     // create semaphores and tasks
-    rx_task_queue = xQueueCreate(1, sizeof(rx_task_action_t));
-    rx_msg_queue = xQueueCreate(1, sizeof(twai_message_t));
-    tx_task_queue = xQueueCreate(1, sizeof(tx_task_action_t));
-    tx_msg_queue = xQueueCreate(1, sizeof(twai_message_t));
     obd_info_mut = xSemaphoreCreateMutex();
-    ctrl_task_sem = xSemaphoreCreateBinary();
+    twai_task_sem = xSemaphoreCreateBinary();
 
     ESP_LOGI(MAIN_TAG, "starting tasks");
-
-    xTaskCreatePinnedToCore(
-        twai_receive_task,
-        "TWAI_rx",
-        16384,
-        NULL,
-        RX_TASK_PRIO,
-        NULL,
-        tskNO_AFFINITY);
-
-    xTaskCreatePinnedToCore(
-        twai_transmit_task,
-        "TWAI_tx",
-        16384,
-        NULL,
-        TX_TASK_PRIO,
-        NULL,
-        tskNO_AFFINITY);
 
     xTaskCreatePinnedToCore(
         twai_control_task,
@@ -331,7 +331,7 @@ extern "C" void app_main(void)
     ESP_LOGI(CTRL_TAG, "TWAI driver started");
 
     // start control task
-    xSemaphoreGive(ctrl_task_sem);
+    xSemaphoreGive(twai_task_sem);
 
     // tasks running, return :)
     return;
