@@ -1,6 +1,6 @@
 # This file was automatically generated for projects
 # without default 'CMakeLists.txt' file.
 
-FILE(GLOB_RECURSE app_sources ${CMAKE_SOURCE_DIR}/src/twai_obd_slave_main.cpp)
+FILE(GLOB_RECURSE app_sources ${CMAKE_SOURCE_DIR}/src/twai_obd_master_main.cpp)
 
 idf_component_register(SRCS ${app_sources})

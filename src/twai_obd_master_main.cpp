@@ -29,7 +29,7 @@
 #define RPM_TAG "rpm_task"
 #define SPEED_TAG "speed_task"
 
-#define ID_MASTER_REQ_DTA 0x7DF
+#define ID_MASTER_REQ_DTA 0x7E0
 #define ID_SLAVE_RESP_DTA 0x7E8
 #define OBD_SVC_DTA 0x01
 #define OBD_DEV_RPM 0x0C
@@ -45,7 +45,7 @@
 #define OBD_FRAME_CONS (0x02)
 #define OBD_FRAME_FLOW (0x03)
 #define OBD_CONSEC_DELAY (0x0A)
-#define OBD_CONSEC_COUNT (0x00)
+#define OBD_CONSEC_COUNT (0x05)
 
 #define MSB_NIBBLE(A) ((A >> 4) & 0x0F)
 #define LSB_NIBBLE(A) ((A) & 0x0F)
@@ -232,6 +232,8 @@ static void twai_ctrl_task(void *arg)
 
         // reset finite state machine to make a request
         state = TX_SEND_REQ;
+        rem_dta = 0;
+        clear_to_send = 0;
         *t.dta_len = 0;
 
         // start request finite state machine
@@ -417,25 +419,25 @@ extern "C" void app_main(void)
         tskNO_AFFINITY
     );
 
-    // xTaskCreatePinnedToCore(
-    //     speed_task,
-    //     "speed_task",
-    //     16384,
-    //     NULL,
-    //     OBD_TASK_PRIO,
-    //     NULL,
-    //     tskNO_AFFINITY
-    // );
+    xTaskCreatePinnedToCore(
+        speed_task,
+        "speed_task",
+        16384,
+        NULL,
+        OBD_TASK_PRIO,
+        NULL,
+        tskNO_AFFINITY
+    );
 
-    // xTaskCreatePinnedToCore(
-    //     rpm_task,
-    //     "rpm_task",
-    //     16384,
-    //     NULL,
-    //     OBD_TASK_PRIO,
-    //     NULL,
-    //     tskNO_AFFINITY
-    // );
+    xTaskCreatePinnedToCore(
+        rpm_task,
+        "rpm_task",
+        16384,
+        NULL,
+        OBD_TASK_PRIO,
+        NULL,
+        tskNO_AFFINITY
+    );
 
     // start control task
     xSemaphoreGive(twai_task_sem);
