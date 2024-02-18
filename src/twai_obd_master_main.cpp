@@ -44,8 +44,8 @@
 #define OBD_FRAME_FIRST (0x01)
 #define OBD_FRAME_CONS (0x02)
 #define OBD_FRAME_FLOW (0x03)
-#define OBD_CONSEC_DELAY (0xFF)
-#define OBD_CONSEC_COUNT (0x02)
+#define OBD_CONSEC_DELAY (0x0A)
+#define OBD_CONSEC_COUNT (0x00)
 
 #define MSB_NIBBLE(A) ((A >> 4) & 0x0F)
 #define LSB_NIBBLE(A) ((A) & 0x0F)
@@ -245,22 +245,27 @@ static void twai_ctrl_task(void *arg)
                 out_msg.data_length_code = 8;
                 out_msg.data[0] = 0x02;
                 out_msg.data[1] = t.service;
-                out_msg.data[2] = t.s_id;
+                out_msg.data[2] = t.s_id;                
+                for (int i = 3; i < 8; i++)
+                {
+                    out_msg.data[i] = 0xAA;
+                }
                 ESP_LOGI(
                     CTRL_TAG,
                     "transmit request %02x %02x",
                     out_msg.data[1],
                     out_msg.data[2]);
                 twai_transmit(&out_msg, portMAX_DELAY);
+                esp_log_buffer(CTRL_TAG, out_msg.data, 8);
                 state = RX_RECV_SLAVE_SNGL_FRST;
                 break;
             case RX_RECV_SLAVE_SNGL_FRST:
                 // get first frame
                 ESP_LOGI(
                     CTRL_TAG, 
-                    "receive single/first frame, first byte %02x", 
-                    inc_msg.data[0]);
+                    "receive single/first frame");
                 twai_receive(&inc_msg, portMAX_DELAY);
+                esp_log_buffer(CTRL_TAG, inc_msg.data, 8);
                 frame_type = MSB_NIBBLE(inc_msg.data[0]);
                 if (frame_type == OBD_FRAME_SINGLE)
                 {
@@ -304,6 +309,10 @@ static void twai_ctrl_task(void *arg)
                 out_msg.data[0] = 0x30;
                 out_msg.data[1] = OBD_CONSEC_COUNT;
                 out_msg.data[2] = OBD_CONSEC_DELAY;
+                for (int i = 3; i < 8; i++)
+                {
+                    out_msg.data[i] = 0xAA;
+                }
                 clear_to_send = OBD_CONSEC_COUNT;
                 ESP_LOGI(
                     CTRL_TAG,
@@ -311,6 +320,7 @@ static void twai_ctrl_task(void *arg)
                     out_msg.data[1],
                     out_msg.data[2]);
                 twai_transmit(&out_msg, portMAX_DELAY);
+                esp_log_buffer(CTRL_TAG, out_msg.data, 8);
 
                 state = RX_RECV_SLAVE_CONS;
                 break;
@@ -323,15 +333,15 @@ static void twai_ctrl_task(void *arg)
                     rem_dta);
 
                 twai_receive(&inc_msg, portMAX_DELAY);
+                esp_log_buffer(CTRL_TAG, inc_msg.data, 8);
                 frame_len = MIN(7, rem_dta);
                 memcpy(&t.dta[*t.dta_len], &inc_msg.data[1], frame_len);
                 *t.dta_len += frame_len;
                 rem_dta -= frame_len;
-                clear_to_send--;
 
                 if (rem_dta)
                 {
-                    if (clear_to_send == 0)
+                    if (clear_to_send == 1)
                     {
                         state = TX_SEND_FLOW;
                     }
@@ -339,6 +349,9 @@ static void twai_ctrl_task(void *arg)
                     {
                         state = RX_RECV_SLAVE_CONS;
                     }
+
+                    if (clear_to_send)
+                        clear_to_send--;
                 }
                 else
                 {
@@ -404,25 +417,25 @@ extern "C" void app_main(void)
         tskNO_AFFINITY
     );
 
-    xTaskCreatePinnedToCore(
-        speed_task,
-        "speed_task",
-        16384,
-        NULL,
-        OBD_TASK_PRIO,
-        NULL,
-        tskNO_AFFINITY
-    );
+    // xTaskCreatePinnedToCore(
+    //     speed_task,
+    //     "speed_task",
+    //     16384,
+    //     NULL,
+    //     OBD_TASK_PRIO,
+    //     NULL,
+    //     tskNO_AFFINITY
+    // );
 
-    xTaskCreatePinnedToCore(
-        rpm_task,
-        "rpm_task",
-        16384,
-        NULL,
-        OBD_TASK_PRIO,
-        NULL,
-        tskNO_AFFINITY
-    );
+    // xTaskCreatePinnedToCore(
+    //     rpm_task,
+    //     "rpm_task",
+    //     16384,
+    //     NULL,
+    //     OBD_TASK_PRIO,
+    //     NULL,
+    //     tskNO_AFFINITY
+    // );
 
     // start control task
     xSemaphoreGive(twai_task_sem);

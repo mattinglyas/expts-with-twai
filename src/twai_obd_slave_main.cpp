@@ -73,10 +73,10 @@ static uint8_t speed;
 
 // KMHC75LD0MU250580
 static const uint8_t vin[] = {
-    0x4B, 0x4D, 0x48, 0x43, 0x37, 
-    0x35, 0x4C, 0x44, 0x30, 0x4D, 
-    0x55, 0x32, 0x35, 0x30, 0x35, 
-    0x38, 0x30};
+    0x01, 0x4B, 0x4D, 0x48, 0x43, 
+    0x37, 0x35, 0x4C, 0x44, 0x30,
+    0x4D, 0x55, 0x32, 0x35, 0x30,
+    0x35, 0x38, 0x30};
 
 /* -------------------------------------------------------------------------- */
 /*                             Tasks and Functions                            */
@@ -92,6 +92,7 @@ static void twai_control_task(void *arg)
     uint8_t clear_to_send = 0; // remaining #of frames clear-to-send
     uint8_t frame_len = 0; // number of data bytes in this frame
     uint8_t cons_delay = 0; // delay between consecutive frames
+    uint8_t counter = 1; // mod 0x0F counter for consective frames
     uint8_t dta[4096]; // maximum length of data by CAN-TP spec
     ctrl_task_action_t state;
 
@@ -120,6 +121,9 @@ static void twai_control_task(void *arg)
                     inc_msg.data[2]
                 );
 
+                dta[0] = (0x01 << 6) | inc_msg.data[1];
+                dta[1] = inc_msg.data[2];
+
                 // response based on service and device
                 switch (inc_msg.data[1])
                 {
@@ -129,17 +133,17 @@ static void twai_control_task(void *arg)
                     case OBD_DEV_RPM:
                         // 0x01 0x0C
                         xSemaphoreTake(obd_info_mut, portMAX_DELAY);
-                        dta[0] = (uint8_t) (rpm >> 8);
-                        dta[1] = (uint8_t) rpm;
+                        dta[2] = (uint8_t) (rpm >> 8);
+                        dta[3] = (uint8_t) rpm;
                         xSemaphoreGive(obd_info_mut);
-                        rem_dta = 2;
+                        rem_dta = 4;
                         break;
                     case OBD_DEV_SPD:
                         // 0x01 0x0D
                         xSemaphoreTake(obd_info_mut, portMAX_DELAY);
-                        dta[0] = speed;
+                        dta[2] = speed;
                         xSemaphoreGive(obd_info_mut);
-                        rem_dta = 1;
+                        rem_dta = 3;
                         break;
                     default:
                         // unsupported device
@@ -152,8 +156,8 @@ static void twai_control_task(void *arg)
                     {
                     case OBD_INF_VIN:
                         // 0x09 0x02
-                        memcpy(dta, vin, 17);
-                        rem_dta = 17;
+                        memcpy(&dta[2], vin, 18);
+                        rem_dta = 20;
                         break;
                     default:
                         // unsupported info
@@ -207,6 +211,7 @@ static void twai_control_task(void *arg)
                 memcpy(&out_msg.data[2], &dta[dta_len], frame_len);
                 dta_len += frame_len;
                 rem_dta -= frame_len;
+                counter = 1;
 
                 twai_transmit(&out_msg, portMAX_DELAY);
                 state = RX_RECV_FLOW;
@@ -238,15 +243,16 @@ static void twai_control_task(void *arg)
                 out_msg.identifier = ID_SLAVE_RESP_DTA;
                 out_msg.data_length_code = 8;
                 frame_len = MIN(7, rem_dta);
-                memcpy(&out_msg.data[2], &dta[dta_len], frame_len);
+                out_msg.data[0] = 0x20 + counter;
+                memcpy(&out_msg.data[1], &dta[dta_len], frame_len);
                 twai_transmit(&out_msg, portMAX_DELAY);
                 dta_len += frame_len;
                 rem_dta -= frame_len;
-                clear_to_send--;
+                counter = (counter + 1) % 0x0F;
 
                 if (rem_dta)
                 {
-                    if (clear_to_send == 0)
+                    if (clear_to_send == 1)
                     {
                         state = RX_RECV_FLOW;
                     }
@@ -254,6 +260,9 @@ static void twai_control_task(void *arg)
                     {
                         state = TX_SEND_CONS;
                     }
+
+                    if (clear_to_send)
+                        clear_to_send--;
                 }
                 else
                 {
